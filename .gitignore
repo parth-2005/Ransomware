@@ -1,2 +1,3 @@
 /sentinel_entropy.log
 /__pycache__
+/test_vault/*

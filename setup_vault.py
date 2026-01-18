@@ -1,71 +1,61 @@
 import os
-import random
 import shutil
+import random
 
 VAULT_DIR = "./test_vault"
-
-def create_honeytokens():
-    """Create honeytoken (canary) files that trigger alerts when accessed."""
-    print("[*] Creating honeytokens...")
-    
-    # Honeytoken 1: Hidden canary file with fake binary data (looks like encrypted credentials)
-    canary_path = os.path.join(VAULT_DIR, "config_sys_backup.dat")
-    with open(canary_path, "wb") as f:
-        # Random bytes to look like encrypted/important data
-        f.write(os.urandom(1024))
-    print("    [+] Created honeytoken: config_sys_backup.dat (canary file)")
-    
-    # Honeytoken 2: Honeypot subfolder with bait files
-    honeypot_dir = os.path.join(VAULT_DIR, "backup_images")
-    os.makedirs(honeypot_dir, exist_ok=True)
-    
-    honeypot_files = [
-        ("image_backup_001.dat", 512),
-        ("credentials_backup.dat", 256),
-        ("wallet_seed.dat", 128),
-    ]
-    
-    for filename, size in honeypot_files:
-        path = os.path.join(honeypot_dir, filename)
-        with open(path, "wb") as f:
-            f.write(os.urandom(size))
-        print(f"    [+] Created honeypot: backup_images/{filename}")
-    
-    print("[*] Honeytokens created successfully.")
 
 def setup_vault():
     # Clean up existing vault
     if os.path.exists(VAULT_DIR):
         shutil.rmtree(VAULT_DIR)
     os.makedirs(VAULT_DIR)
+    
+    # Create Honeypot directory
+    honey_dir = os.path.join(VAULT_DIR, "backup_images")
+    os.makedirs(honey_dir)
+
     print(f"[*] Created {VAULT_DIR}")
+    print("[*] Generating HEAVY files (this simulates real user data)...")
 
-    # Dummy content
-    content_samples = [
-        "The quick brown fox jumps over the lazy dog.",
-        "To be or not to be, that is the question.",
-        "In the middle of the journey of our life I found myself within a dark woods.",
-        "Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
-        "Ransomware simulation test file. Do not panic.",
-        "Tyger Tyger, burning bright, In the forests of the night,"
-    ]
+    # 1. Create the Honeytoken (Trap) - DO NOT encrypt this quickly!
+    with open(os.path.join(VAULT_DIR, "config_sys_backup.dat"), "wb") as f:
+        f.write(os.urandom(1024))  # 1KB random data
+    print("    [+] Created Honeytoken: config_sys_backup.dat")
+    
+    # 2. Create Honeytokens in subfolder
+    honeypot_files = ["wallet_seed.dat", "credentials_backup.dat", "recovery_key.dat"]
+    for filename in honeypot_files:
+        with open(os.path.join(honey_dir, filename), "wb") as f:
+            f.write(os.urandom(1024))
+        print(f"    [+] Created Honeypot: backup_images/{filename}")
 
-    # Create 20 dummy files
-    for i in range(1, 21):
-        filename = f"file_{i:02d}.txt"
+    # 3. Create "Heavy" Dummy Files (5MB each)
+    # Larger files = Slower encryption = Better chance for Sentinel to catch it
+    print("\n[*] Creating heavy database files (5MB each)...")
+    dummy_data = b"A" * (1024 * 1024 * 5)  # 5MB block of 'A's
+    
+    for i in range(1, 21):  # 20 heavy files = 100MB total
+        filename = f"heavy_data_{i:02d}.db"
+        path = os.path.join(VAULT_DIR, filename)
+        with open(path, "wb") as f:
+            f.write(dummy_data)
+        print(f"    [+] Created 5MB file: {filename}")
+    
+    # 4. Create some small text files (mixed environment)
+    print("\n[*] Creating small text files...")
+    for i in range(1, 11):
+        filename = f"notes_{i:02d}.txt"
         path = os.path.join(VAULT_DIR, filename)
         with open(path, "w") as f:
-            # Repeat content to give it some size
-            f.write("\n".join([random.choice(content_samples) for _ in range(50)]))
-        print(f"    [+] Created {filename}")
+            f.write("Important business data\n" * 100)
+        print(f"    [+] Created text file: {filename}")
     
-    print("[*] Vault setup complete with 20 files.")
-    
-    # Add honeytokens
-    create_honeytokens()
-    
+    print("\n" + "=" * 50)
+    print("[*] Vault setup complete. Ready for battle.")
+    print(f"    - 20 Heavy files (5MB each = 100MB total)")
+    print(f"    - 10 Small text files")
+    print(f"    - 4 Honeytokens (traps)")
     print("=" * 50)
-    print("[*] VAULT READY: 20 text files + honeytokens deployed")
 
 if __name__ == "__main__":
     setup_vault()
