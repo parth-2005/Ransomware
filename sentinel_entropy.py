@@ -3,16 +3,20 @@ import math
 import time
 import logging
 import psutil
+import numpy as np
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from collections import Counter
+from collections import Counter, deque
+from sklearn.ensemble import IsolationForest
 
 # Configuration
 MONITOR_DIR = "./test_vault"
 LOG_FILE = "sentinel_entropy.log"
-# Fernet uses Base64 encoding, so max entropy is ~6 bits. 
-# Real ransomware is >7.5. For this demo, we use 5.5.
-ENTROPY_THRESHOLD = 5.0 
+CANARY_FILE = "config_sys_backup.dat"  # Honeytoken triggers immediate lockdown
+
+# Burst Detection Settings
+BURST_THRESHOLD = 5   # Number of events
+BURST_WINDOW = 1.0    # Within this many seconds
 
 # Setup Logging
 logging.basicConfig(
@@ -23,6 +27,7 @@ logging.basicConfig(
 console = logging.StreamHandler()
 console.setLevel(logging.INFO)
 logging.getLogger().addHandler(console)
+
 
 class EntropyModule:
     @staticmethod
@@ -57,11 +62,71 @@ class EntropyModule:
                 return 0.0
         return 0.0
 
+
+class AnomalyDetector:
+    """ML-based anomaly detection using Isolation Forest."""
+    
+    def __init__(self, training_dir):
+        self.model = IsolationForest(
+            contamination=0.1,  # Expect ~10% anomalies
+            random_state=42,
+            n_estimators=100
+        )
+        self.is_trained = False
+        self._train(training_dir)
+    
+    def _train(self, directory):
+        """Train on benign files using (file_size, entropy) features."""
+        features = []
+        logging.info(f"[ML] Training Isolation Forest on files in {directory}...")
+        
+        try:
+            for root, dirs, files in os.walk(directory):
+                for filename in files:
+                    path = os.path.join(root, filename)
+                    try:
+                        if os.path.isfile(path):
+                            size = os.path.getsize(path)
+                            entropy = EntropyModule.calculate_shannon_entropy(path)
+                            features.append([size, entropy])
+                    except Exception as e:
+                        logging.warning(f"[ML] Skipped {path}: {e}")
+            
+            if len(features) >= 2:
+                self.model.fit(np.array(features))
+                self.is_trained = True
+                logging.info(f"[ML] Training complete. Learned from {len(features)} benign files.")
+            else:
+                logging.warning("[ML] Not enough files to train. Using fallback entropy threshold.")
+                self.is_trained = False
+        except Exception as e:
+            logging.error(f"[ML] Training failed: {e}")
+            self.is_trained = False
+    
+    def predict(self, file_path):
+        """Returns 'malicious' if anomaly detected, 'benign' otherwise."""
+        try:
+            size = os.path.getsize(file_path)
+            entropy = EntropyModule.calculate_shannon_entropy(file_path)
+            
+            if self.is_trained:
+                prediction = self.model.predict([[size, entropy]])
+                # Isolation Forest: -1 = anomaly, 1 = normal
+                verdict = 'malicious' if prediction[0] == -1 else 'benign'
+                logging.debug(f"[ML] Prediction for {file_path}: size={size}, entropy={entropy:.4f}, verdict={verdict}")
+                return verdict
+            else:
+                # Fallback to entropy threshold if ML not trained
+                return 'malicious' if entropy > 5.0 else 'benign'
+        except Exception as e:
+            logging.error(f"[ML] Prediction error for {file_path}: {e}")
+            return 'benign'
+
+
 class MitigationModule:
     @staticmethod
     def identify_process(file_path):
         """Attempts to identify the process modifying the file."""
-        # Note: This is a best-effort approach. Short-lived processes might close the file before we check.
         try:
             for proc in psutil.process_iter(['pid', 'name', 'open_files']):
                 try:
@@ -89,42 +154,93 @@ class MitigationModule:
             logging.error(f"Failed to kill process: {e}")
         return False
 
-class AILogicModule:
     @staticmethod
-    def analyze(entropy, file_extension):
-        """Heuristic analysis to flag malicious behavior."""
-        # Check Entropy
-        # DEBUG LOG
-        # logging.info(f"DEBUG CHECK: {entropy} > {ENTROPY_THRESHOLD} ? {entropy > ENTROPY_THRESHOLD}")
-        
-        if entropy > ENTROPY_THRESHOLD:
-            return 'malicious'
-            
-        # Check Extension
-        if file_extension == '.locked':
-            return 'malicious'
-            
-        return 'benign'
+    def emergency_lockdown(reason):
+        """Kill all suspicious attack processes immediately."""
+        logging.critical(f"!!! EMERGENCY LOCKDOWN !!! Reason: {reason}")
+        killed = 0
+        for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                if p.info['cmdline'] and any("attack" in arg.lower() for arg in p.info['cmdline']):
+                    logging.warning(f"Terminating suspicious process: {p.info['name']} (PID: {p.info['pid']})")
+                    p.kill()
+                    killed += 1
+            except:
+                pass
+        logging.critical(f"Lockdown complete. Terminated {killed} suspicious processes.")
+        return killed
+
 
 class SentinelMonitor(FileSystemEventHandler):
+    def __init__(self, anomaly_detector):
+        self.anomaly_detector = anomaly_detector
+        self.event_times = deque(maxlen=10)  # Track timestamps of last 10 events
+        self.lockdown_triggered = False
+    
+    def _check_burst(self):
+        """Check if there's a burst of events (5+ in 1 second)."""
+        now = time.time()
+        self.event_times.append(now)
+        
+        if len(self.event_times) >= BURST_THRESHOLD:
+            # Count events within the time window
+            recent = [t for t in self.event_times if now - t <= BURST_WINDOW]
+            if len(recent) >= BURST_THRESHOLD:
+                return True
+        return False
+    
+    def _check_honeytoken(self, file_path):
+        """Check if the modified file is a honeytoken (canary)."""
+        filename = os.path.basename(file_path)
+        # Check for main canary file
+        if filename == CANARY_FILE:
+            return True
+        # Check for honeypot folder files
+        if "backup_images" in file_path:
+            return True
+        return False
+
     def on_modified(self, event):
-        if event.is_directory:
+        if event.is_directory or self.lockdown_triggered:
             return
 
         file_path = event.src_path
+        
         # Ignore temp files or the log file itself
         if file_path.endswith(LOG_FILE) or '~' in file_path:
             return
         
-        # Calculate with retry
+        # === CHECK 1: Honeytoken Detection (Instant Kill) ===
+        if self._check_honeytoken(file_path):
+            logging.critical(f"!!! HONEYTOKEN TRIGGERED !!! File: {file_path}")
+            self.lockdown_triggered = True
+            MitigationModule.emergency_lockdown(f"Honeytoken accessed: {file_path}")
+            return
+        
+        # === CHECK 2: Burst Detection (5+ events in 1 second) ===
+        if self._check_burst():
+            logging.critical(f"!!! BURST ATTACK DETECTED !!! {BURST_THRESHOLD}+ events in {BURST_WINDOW}s")
+            self.lockdown_triggered = True
+            MitigationModule.emergency_lockdown(f"Burst attack: {BURST_THRESHOLD}+ events in {BURST_WINDOW}s")
+            return
+        
+        # === CHECK 3: ML-Based Anomaly Detection ===
         entropy = EntropyModule.calculate_shannon_entropy(file_path)
         file_ext = os.path.splitext(file_path)[1]
         
-        verdict = AILogicModule.analyze(entropy, file_ext)
+        # Check for known ransomware extension
+        if file_ext == '.locked':
+            logging.warning(f"RANSOMWARE EXTENSION DETECTED on {file_path}")
+            self.lockdown_triggered = True
+            MitigationModule.emergency_lockdown(f"Ransomware extension: {file_path}")
+            return
+        
+        # Use ML model for prediction
+        verdict = self.anomaly_detector.predict(file_path)
         
         # Only log significant events to reduce noise
         if entropy > 0 or verdict == 'malicious':
-             logging.info(f"File Modified: {file_path} | Entropy: {entropy:.4f} | Verdict: {verdict}")
+            logging.info(f"File Modified: {file_path} | Entropy: {entropy:.4f} | ML Verdict: {verdict}")
 
         if verdict == 'malicious':
             logging.warning(f"MALICIOUS ACTIVITY DETECTED on {file_path}")
@@ -135,16 +251,15 @@ class SentinelMonitor(FileSystemEventHandler):
             if proc:
                 MitigationModule.kill_process(proc)
             else:
-                 # Fallback for demo: Look for likely culprits 
-                 for p in psutil.process_iter(['pid', 'name', 'cmdline']):
-                     try:
-                         if p.info['cmdline'] and any("attack" in arg for arg in p.info['cmdline']):
-                             logging.warning(f"Fallback Identification found suspect process: {p.info['name']} {p.info['cmdline']}")
-                             MitigationModule.kill_process(p)
-                             break
-                     except:
+                # Fallback for demo: Look for likely culprits 
+                for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+                    try:
+                        if p.info['cmdline'] and any("attack" in arg for arg in p.info['cmdline']):
+                            logging.warning(f"Fallback Identification found suspect process: {p.info['name']} {p.info['cmdline']}")
+                            MitigationModule.kill_process(p)
+                            break
+                    except:
                         pass
-
 
     def on_moved(self, event):
         if event.is_directory:
@@ -155,17 +270,29 @@ class SentinelMonitor(FileSystemEventHandler):
     def on_created(self, event):
         self.on_modified(event)
 
-def main():
-    print("==========================================")
-    print("   SentinelEntropy: Ransomware Guard")
-    print("==========================================")
-    print(f"[*] Monitoring directory: {MONITOR_DIR}")
-    print(f"[*] Entropy Threshold: {ENTROPY_THRESHOLD} (Tuned for Base64)")
 
-    event_handler = SentinelMonitor()
+def main():
+    print("=" * 60)
+    print("   SentinelEntropy: ML-Powered Ransomware Guard")
+    print("=" * 60)
+    print(f"[*] Monitoring directory: {MONITOR_DIR}")
+    print(f"[*] Honeytoken file: {CANARY_FILE}")
+    print(f"[*] Burst detection: {BURST_THRESHOLD} events in {BURST_WINDOW}s")
+    print("[*] Detection: Isolation Forest ML + Entropy Analysis")
+    print("-" * 60)
+    
+    # Initialize ML model by training on current benign files
+    print("[*] Training ML model on existing files...")
+    anomaly_detector = AnomalyDetector(MONITOR_DIR)
+    
+    event_handler = SentinelMonitor(anomaly_detector)
     observer = Observer()
-    observer.schedule(event_handler, MONITOR_DIR, recursive=False)
+    # Enable recursive monitoring to catch honeypot folder access
+    observer.schedule(event_handler, MONITOR_DIR, recursive=True)
     observer.start()
+    
+    print("[*] Sentinel ACTIVE. Press Ctrl+C to stop.")
+    print("=" * 60)
 
     try:
         while True:
@@ -174,6 +301,6 @@ def main():
         observer.stop()
     observer.join()
 
+
 if __name__ == "__main__":
     main()
-
